@@ -1,0 +1,529 @@
+METHOD if_http_extension~handle_request.
+
+*    USAGE:
+*
+*    " GET
+*    http://sap.company.com:portnumber/sap/bc/zsubmitalv/getData?report=MB52&variant=APK&s_spart=10&matnr_low=G2003M01&matnr_high=G3003M01
+*
+*    " POST (JSON)
+*    http://sap.company.com:portnumber/sap/bc/zsubmitalv/getData
+*    {
+*        "report": "MB52",
+*        "variant": "APK",
+*        "s_spart": "10",
+*        "matnr":
+*        {
+*            "from": "G2003M01",
+*            "to": "G3003M01"
+*        }
+*    }
+
+
+  TYPE-POOLS: abap,
+              kkblo.
+
+  DATA: lo_json_data     TYPE REF TO zcl_trex_json_serializer,
+        lo_json_metadata TYPE REF TO zcl_trex_json_serializer.
+
+* Data definition
+
+  DATA: _path_info            TYPE string,
+        _verb                 TYPE string,
+        _callback             TYPE string,
+        _json_string          TYPE string,
+        _json_string_data     TYPE string,
+        _json_string_metadata TYPE string.
+
+  DATA: _it_inputparams TYPE tihttpnvp,
+        _inputparams    TYPE LINE OF tihttpnvp.
+
+  DATA: _pgmna    TYPE tstc-pgmna,
+        _tcode    TYPE tstc-tcode,
+        _report   TYPE tstc-pgmna,
+        _variant  TYPE rsvar-variant,
+        _kunnr    TYPE kunnr.
+
+  DATA: _data            TYPE REF TO data,
+        _data_x          TYPE REF TO data,
+        _data_line       TYPE REF TO data,
+        _data_descr      TYPE REF TO cl_abap_datadescr,
+        _data_line_descr TYPE REF TO cl_abap_datadescr.
+
+  DATA: _datafield(40).
+
+  FIELD-SYMBOLS: <_datafield> TYPE any.
+
+  DATA: BEGIN OF _metadata,
+          is_hierseq   TYPE abap_bool,
+          tabname      TYPE string,
+          tabname_line TYPE string,
+          s_keyinfo    TYPE kkblo_keyinfo,
+          s_layout     TYPE lvc_s_layo,
+          t_fcat       TYPE lvc_t_fcat,
+          t_filter     TYPE lvc_t_filt,
+          t_sort       TYPE lvc_t_sort,
+        END OF _metadata.
+
+  FIELD-SYMBOLS: <_data>        TYPE STANDARD TABLE,
+                 <_data_x>      TYPE STANDARD TABLE,
+                 <_wa_data>     TYPE any,
+                 <_wa_metadata> TYPE any.
+
+  DATA: _fcat TYPE lvc_s_fcat.
+
+  DATA: _amount(40),
+        _waersfield(40),
+        _currfield(40).
+
+  DATA: _ttext       TYPE tstct-ttext,
+        _description TYPE char120.
+
+  FIELD-SYMBOLS: <_waers>    TYPE any,
+                 <_currency> TYPE any.
+
+  DATA: ls_filter             TYPE  lvc_s_filt,
+        lt_grouplevels        TYPE  lvc_t_grpl,
+        iv_ignoring_case      TYPE  char01,
+        lt_filter_index       TYPE  lvc_t_fidx,
+        lt_grouplevels_filter TYPE  lvc_t_grpl.
+
+
+  DATA: lv_response  TYPE string.
+  DATA: ls_textid    TYPE scx_t100key.
+
+* Process request
+  _path_info = server->request->get_header_field( name = '~path_info' ).
+  _verb = server->request->get_header_field( name = '~request_method' ).
+
+  SHIFT _path_info LEFT BY 1 PLACES.
+
+
+  IF _verb NE 'GET'.
+
+    server->request->get_header_fields( CHANGING fields = mt_head_fields ).
+    server->request->get_form_fields(   CHANGING fields = mt_form_fields ).
+
+    mv_json_data = server->request->get_data( ).
+
+    DATA:
+      lr_data     TYPE REF TO data,
+      ld_add_text TYPE string,
+      lo_pos_struct    TYPE REF TO cl_abap_structdescr.
+
+    FIELD-SYMBOLS:
+       <l_postab_ref> TYPE any,
+       <lt_postab>    TYPE ANY TABLE,
+       <l_pos>        TYPE any,
+       <l_fvalue>     TYPE any.
+
+
+    CALL METHOD /ui2/cl_json=>deserialize(
+      EXPORTING
+        jsonx            = mv_json_data
+   "    pretty_name = /ui2/cl_json=>pretty_mode-none
+      CHANGING
+        data             = lr_data
+     ).
+
+    ASSIGN lr_data->* TO FIELD-SYMBOL(<ls_data>).
+
+    lo_pos_struct ?= cl_abap_typedescr=>describe_by_data( <ls_data> ).
+    DATA(lt_pos_comp) = lo_pos_struct->get_components( ).
+
+    DO.
+
+      ASSIGN COMPONENT sy-index OF STRUCTURE <ls_data> TO FIELD-SYMBOL(<l_field_ref>).
+      IF sy-subrc <> 0. EXIT. ENDIF.
+      ASSIGN <l_field_ref>->* TO <l_fvalue>.
+
+      DATA some_tdo TYPE REF TO cl_abap_typedescr.
+      some_tdo = cl_abap_typedescr=>describe_by_data( <l_fvalue> ).
+
+      IF some_tdo IS INSTANCE OF cl_abap_elemdescr.
+        INSERT VALUE #(
+            name  = lt_pos_comp[ sy-index ]-name
+            value = <l_fvalue>
+          ) INTO TABLE _it_inputparams.
+      ELSE.
+        DATA: ls_components TYPE abap_compdescr.
+        DATA: lo_strucdescr TYPE REF TO cl_abap_structdescr.
+        lo_strucdescr ?= cl_abap_typedescr=>describe_by_data( <l_fvalue> ).
+
+        LOOP AT lo_strucdescr->components INTO ls_components.
+          ASSIGN COMPONENT sy-tabix OF STRUCTURE <l_fvalue> TO FIELD-SYMBOL(<l_var_ref>).
+          ASSIGN <l_var_ref>->* TO FIELD-SYMBOL(<fl_value>).
+
+          DATA(v_name) = lt_pos_comp[ sy-index ]-name && '_' && ls_components-name.
+          DATA(v_value) =  CONV string( <fl_value> ).
+
+          INSERT VALUE #(
+            name  = v_name
+            value = v_value
+          ) INTO TABLE _it_inputparams.
+        ENDLOOP.
+      ENDIF.
+
+    ENDDO.
+
+  ELSE.
+
+    CALL METHOD server->request->get_form_fields
+      CHANGING
+        fields = _it_inputparams.
+
+  ENDIF.
+
+
+  LOOP AT _it_inputparams INTO _inputparams.
+    TRANSLATE: _inputparams-name  TO UPPER CASE,
+               _inputparams-value TO UPPER CASE.
+    MODIFY _it_inputparams FROM _inputparams.
+  ENDLOOP.
+
+  CLEAR _inputparams.
+
+  READ TABLE _it_inputparams INTO _inputparams WITH KEY name = 'REPORT'.
+  DELETE _it_inputparams WHERE name = 'REPORT'.
+  _report = _inputparams-value.
+  CLEAR _inputparams.
+
+  READ TABLE _it_inputparams INTO _inputparams WITH KEY name = 'VARIANT'.
+  DELETE _it_inputparams WHERE name = 'VARIANT'.
+  _variant = _inputparams-value.
+  CLEAR _inputparams.
+
+  READ TABLE _it_inputparams INTO _inputparams WITH KEY name = 'CALLBACK'.
+  DELETE _it_inputparams WHERE name = 'CALLBACK'.
+  _callback = _inputparams-value.
+  CLEAR _inputparams.
+
+
+  IF _report IS INITIAL.
+    CALL METHOD server->response->set_status( code = '404' reason = 'Parameter missing' ).
+    CALL METHOD server->response->set_cdata( data = _report && ' ' && _variant && ' ' && _kunnr && 'Input Paramater "report" is missing' ).
+    EXIT.
+  ENDIF.
+
+* check progname
+  SELECT SINGLE pgmna
+  INTO @_pgmna
+  FROM tstc
+  WHERE pgmna = @_report.
+
+  IF sy-subrc <> 0.
+
+    SELECT SINGLE pgmna
+    INTO @_pgmna
+    FROM tstc
+    WHERE tcode = @_report.
+
+    IF sy-subrc <> 0.
+      CALL METHOD server->response->set_status( code = '404' reason = 'Report not exist' ).
+      CALL METHOD server->response->set_cdata( data = _report && ' ' && _variant && ' ' && _kunnr && 'Input Paramater "report" does not exist' ).
+      EXIT.
+    ENDIF.
+
+  ENDIF.
+
+
+  cl_salv_bs_runtime_info=>set( EXPORTING display  = abap_false
+                                          metadata = abap_true
+                                          data     = abap_true ).
+
+
+
+  " SUBMIT REPORT
+  """"""""""""""""""""""""""""""""""""""""""""""""""""""""""
+  DATA: _it_valutab TYPE STANDARD TABLE OF rsparams.
+  DATA: _it_paramtab TYPE STANDARD TABLE OF rsparams.
+
+  DATA: fname(45)   TYPE c.
+  DATA: v_low(45)   TYPE c.
+  DATA: v_high(45)  TYPE c.
+
+  IF _variant IS NOT INITIAL.
+     CALL FUNCTION 'RS_VARIANT_CONTENTS'
+       EXPORTING
+         report               = _pgmna
+         variant              = _variant
+       TABLES
+         valutab              = _it_valutab
+       EXCEPTIONS
+         variant_non_existent = 1
+         variant_obsolete     = 2
+         OTHERS               = 3.
+   ENDIF.
+
+   IF _it_inputparams IS NOT INITIAL.
+     SORT _it_inputparams BY name AS TEXT.
+     LOOP AT _it_inputparams ASSIGNING FIELD-SYMBOL(<ls_param>).
+
+
+       IF NOT ( SubString( Val = <ls_param>-name Off = strlen( <ls_param>-name ) - 4 ) EQ '_LOW' OR
+                SubString( Val = <ls_param>-name Off = strlen( <ls_param>-name ) - 5 ) EQ '_FROM' OR
+                SubString( Val = <ls_param>-name Off = strlen( <ls_param>-name ) - 3 ) EQ '_TO' OR
+                SubString( Val = <ls_param>-name Off = strlen( <ls_param>-name ) - 5 ) EQ '_HIGH' ).
+
+         fname = <ls_param>-name.
+         v_low = <ls_param>-value.
+         v_high = ''.
+
+       ELSE.
+
+         DATA: substring_tab TYPE STANDARD TABLE OF string.
+         SPLIT <ls_param>-name AT '_' INTO TABLE substring_tab IN CHARACTER MODE.
+
+         fname = substring_before( val = <ls_param>-name sub = '_' occ = ( lines( substring_tab ) - 1 ) ).
+         CASE substring_after( val = <ls_param>-name sub = '_' occ = ( lines( substring_tab ) - 1 ) ).
+         WHEN 'TO' OR 'HIGH'.
+           v_high = <ls_param>-value.
+           v_low = ''.
+         WHEN OTHERS.
+           v_low = <ls_param>-value.
+           v_high = ''.
+         ENDCASE.
+
+       ENDIF.
+
+       READ TABLE _it_paramtab WITH KEY selname = fname TRANSPORTING NO FIELDS.
+
+       IF sy-subrc <> 0.
+         INSERT VALUE #(
+            selname = fname
+            kind = 'P'
+            "sign = 'I'
+            "option = 'EQ'
+            low  = v_low
+            high = v_high
+          ) INTO TABLE _it_paramtab.
+       ELSE.
+         LOOP AT _it_paramtab ASSIGNING FIELD-SYMBOL(<fs_paramtab>) WHERE selname = fname.
+           IF <fs_paramtab>-low IS INITIAL.
+             <fs_paramtab>-low = v_low.
+           ELSE.
+             <fs_paramtab>-high = v_high.
+           ENDIF.
+
+           <fs_paramtab>-kind = 'S'.
+           <fs_paramtab>-sign = 'I'.
+           <fs_paramtab>-option = 'BT'.
+         ENDLOOP.
+       ENDIF.
+     ENDLOOP.
+
+     LOOP AT _it_paramtab ASSIGNING <fs_paramtab>.
+       IF line_exists( _it_valutab[ selname = <fs_paramtab>-selname ] ).
+         DELETE _it_valutab WHERE selname = <fs_paramtab>-selname  .
+       ENDIF.
+       READ TABLE _it_paramtab INTO DATA(select_wa) WITH key selname = <fs_paramtab>-selname .
+       APPEND select_wa TO _it_valutab.
+     ENDLOOP.
+
+   ENDIF.
+
+
+   IF _it_valutab IS NOT INITIAL.
+     SUBMIT (_pgmna) WITH SELECTION-TABLE _it_valutab AND RETURN.
+   ELSE.
+     SUBMIT (_pgmna) AND RETURN.
+   ENDIF.
+
+
+
+  " GET DATA
+  """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+  cl_salv_bs_runtime_info=>get_data_ref( IMPORTING
+                                           r_data            = _data_x
+                                           "r_data_line      = _data_line
+                                           r_data_descr      = _data_descr
+                                           r_data_line_descr = _data_line_descr ).
+
+  cl_salv_bs_runtime_info=>get_metadata( RECEIVING value = _metadata ).
+
+  ASSIGN _data_x->* TO <_data_x>.
+
+  " get rid off ref_field, delete no_out & tech
+  LOOP AT _metadata-t_fcat ASSIGNING FIELD-SYMBOL(<fs_fcat>).
+    <fs_fcat>-ref_field = ' '.
+    <fs_fcat>-intlen = 23.
+    IF <fs_fcat>-no_out EQ 'X' OR <fs_fcat>-tech EQ 'X'.
+      DELETE _metadata-t_fcat WHERE fieldname EQ <fs_fcat>-fieldname.
+    ENDIF.
+  ENDLOOP.
+
+  " create new table
+  CALL METHOD cl_alv_table_create=>create_dynamic_table
+  EXPORTING
+    "i_style_table            = 'X'
+    it_fieldcatalog           = _metadata-t_fcat
+  IMPORTING
+    ep_table                  = _data
+  EXCEPTIONS
+    generate_subpool_dir_full = 1
+    OTHERS                    = 2.
+
+  ASSIGN _data->* TO <_data>.
+  MOVE-CORRESPONDING <_data_x> TO <_data>.
+
+  " As Filtered Internal Table
+  IF _metadata-t_filter IS NOT INITIAL.
+    READ TABLE _metadata-t_filter INTO ls_filter INDEX 1.
+    CALL FUNCTION 'LVC_FILTER_APPLY'
+    EXPORTING
+      it_fieldcatalog       = _metadata-t_fcat
+      it_filter             = _metadata-t_filter
+      it_grouplevels        = lt_grouplevels
+      i_tabname             = ls_filter-tabname
+      i_ignoring_case       = iv_ignoring_case
+    IMPORTING
+      et_filter_index       = lt_filter_index
+      et_grouplevels_filter = lt_grouplevels_filter
+    TABLES
+      it_data               = <_data>.
+
+    SORT lt_filter_index BY table_line DESCENDING.
+
+    LOOP AT lt_filter_index ASSIGNING FIELD-SYMBOL(<index>).
+      DELETE <_data> INDEX <index>.
+    ENDLOOP.
+  ENDIF.
+
+  cl_salv_bs_runtime_info=>clear_all( ).
+
+  """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+  IF _path_info EQ 'getData'.
+
+      IF <_data> IS ASSIGNED.
+        lv_response = /ui2/cl_json=>serialize( pretty_name = /ui2/cl_json=>pretty_mode-camel_case
+                                               data        = <_data> ).
+      ENDIF.
+
+       server->response->set_header_field( name = 'content-type' value = 'application/json; charset=UTF-8' ).
+       server->response->set_cdata( lv_response ).
+       server->response->set_status( code = cl_rest_status_code=>gc_success_ok reason = 'OK' ).
+
+  ELSEIF _path_info EQ 'getALV'.
+
+      TRY.
+*         Modify data for output
+          LOOP AT <_data> ASSIGNING <_wa_data>.
+*           Modify data with conversion routines
+            LOOP AT _metadata-t_fcat INTO _fcat WHERE edit_mask IS NOT INITIAL
+                                                  AND inttype = 'C'.
+              CONCATENATE '<_WA_DATA>-'
+                          _fcat-fieldname
+                     INTO _datafield.
+
+              ASSIGN (_datafield) TO <_datafield>.
+              WRITE <_datafield> TO <_datafield> USING EDIT MASK _fcat-edit_mask.
+            ENDLOOP.
+
+*           Modify currency amount
+            LOOP AT _metadata-t_fcat INTO _fcat WHERE datatype = 'CURR'
+                                                  AND cfieldname IS NOT INITIAL.
+
+              CONCATENATE '<_WA_DATA>-' _fcat-cfieldname INTO _waersfield.
+              CONCATENATE '<_WA_DATA>-' _fcat-fieldname INTO _currfield.
+
+              ASSIGN: (_waersfield) TO <_waers>,
+                      (_currfield)  TO <_currency>.
+
+              CALL FUNCTION 'CURRENCY_AMOUNT_SAP_TO_IDOC'
+                EXPORTING
+                  currency    = <_waers>
+                  sap_amount  = <_currency>
+                IMPORTING
+                  idoc_amount = _amount.
+
+              CONDENSE _amount.
+              <_currency> = _amount.
+
+            ENDLOOP.
+
+          ENDLOOP.
+
+        CATCH cx_salv_bs_sc_runtime_info.
+*         If error detected then abort
+          CALL METHOD server->response->set_status( code = '404' reason = 'Unable to retrieve ALV data' ).
+          CALL METHOD server->response->set_cdata( data = _json_string ).
+          EXIT.
+
+      ENDTRY.
+
+*     create instance of json serialiser
+      CREATE OBJECT lo_json_data
+        EXPORTING
+          data = <_data>.
+
+*     serialize data
+      lo_json_data->serialize( ).
+
+*     get serialized json data string
+      _json_string_data = lo_json_data->get_data( ).
+
+*     create instance of json serialiser
+      CREATE OBJECT lo_json_metadata
+        EXPORTING
+          data = _metadata-t_fcat.
+
+*     serialize metadata
+      lo_json_metadata->serialize( ).
+
+*     get serialized json metadata string
+      _json_string_metadata = lo_json_metadata->get_data( ).
+
+      IF _json_string_metadata IS NOT INITIAL.
+        CONCATENATE '"alvMetadata":' _json_string_metadata INTO _json_string_metadata SEPARATED BY space.
+      ENDIF.
+
+      IF _json_string_data IS NOT INITIAL.
+        CONCATENATE '"alvData":' _json_string_data INTO _json_string_data SEPARATED BY space.
+      ENDIF.
+
+*     Tcode description
+      SELECT SINGLE ttext
+      INTO _ttext
+      FROM tstct
+      WHERE sprsl = sy-langu
+        AND tcode = _tcode.
+
+      CONCATENATE '"description":"' _ttext '"' INTO _description.
+
+*     JSON
+      CONCATENATE '{' _description ',' _json_string_metadata ',' _json_string_data '}' INTO _json_string SEPARATED BY space.
+
+*     to support JSONP
+      CONCATENATE _callback '(' _json_string ')' INTO _json_string.
+
+*     set the response mimetype to json
+*     Set the content type
+      CALL METHOD server->response->set_header_field(
+          name  = 'Content-Type'
+          value = 'application/json; charset=utf-8' "for JSON
+        ).
+
+*     Set CORS access control to avoid browser policy restrictions around
+*     Cross Domain communication
+      CALL METHOD server->response->set_header_field( name = 'Access-Control-Allow-Origin' value = '*' ).
+
+*    * set Allow methods
+*      CALL METHOD server->response->set_header_field( name = 'Access-Control-Allow-Methods' value = 'GET' ).
+
+*     set the cdata response to the json string
+      CALL METHOD server->response->set_cdata( data = _json_string ).
+
+
+    ELSE.
+
+      server->response->set_status( code = cl_rest_status_code=>gc_server_error_internal reason = 'Hata' ).
+      IF 1 = 2.MESSAGE e000(zcrm).ENDIF.
+      ls_textid-msgid = _report.
+      ls_textid-msgno = '000'.
+      ls_textid-attr1 = 'Hatalı metod ismi'.
+      RAISE EXCEPTION TYPE cx_rest_client_exception
+        EXPORTING
+          textid = ls_textid.
+
+    ENDIF.
+
+ENDMETHOD.                    "if_http_extension~handle_request
